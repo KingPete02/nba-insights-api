@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import AsyncGenerator
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
 from app.core.security import decode_access_token
@@ -11,7 +11,7 @@ from app.db.session import AsyncSessionLocal
 from app.repositories.users import UsersRepository
 from app.schemas.user import UserPublic
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v1/auth/login")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_db() -> AsyncGenerator:
@@ -20,9 +20,14 @@ async def get_db() -> AsyncGenerator:
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db=Depends(get_db),
 ) -> UserPublic:
+    if creds is None or not creds.credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    token = creds.credentials
+
     try:
         payload = decode_access_token(token)
         user_id: str | None = payload.get("sub")
