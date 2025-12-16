@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,12 +13,15 @@ from app.core.middleware import RequestIdLoggingMiddleware
 
 setup_logging()
 
+allow_docs = os.getenv("ALLOW_DOCS", "false").lower() == "true"
+is_prod = settings.ENV == "production"
+
 app = FastAPI(
     title="NBA Insights API",
     version="0.1.0",
-    docs_url="/docs" if settings.ENV != "production" else None,
-    redoc_url="/redoc" if settings.ENV != "production" else None,
-    openapi_url="/openapi.json" if settings.ENV != "production" else None,
+    docs_url="/docs" if (allow_docs or not is_prod) else None,
+    redoc_url="/redoc" if (allow_docs or not is_prod) else None,
+    openapi_url="/openapi.json" if (allow_docs or not is_prod) else None,
 )
 
 install_error_handlers(app)
