@@ -482,21 +482,53 @@ def fmt_spread(x: float) -> str:
     return f"{v:+g}"
 
 
+
 @router.get("/edges/today")
 async def edges_today(
     market: Literal["spreads", "totals"] = Query(default="spreads"),
     min_ev: float = Query(default=0.02, ge=-1.0, le=10.0),
-    max_results: int = Query(default=25, ge=1, le=200),
+    max_results: int = Query(default=50, ge=1, le=500),
 ) -> dict:
+    """
+    Positive-EV feed: edges vs multi-book odds (spread/total).
+    Returns UI-ready rows: game info + fair line + book line + implied/model probs + EV.
+    """
+    # Scoreboard map for game metadata (time/status/teams)
+    try:
+        sb_raw = await _fetch_today_scoreboard_raw()
+    except Exception:
+        sb_raw = []
+
+    sb_by_game: dict[str, dict[str, Any]] = {}
+    for g in sb_raw:
+        home = (g.get("homeTeam") or {}) if isinstance(g.get("homeTeam"), dict) else {}
+        away = (g.get("awayTeam") or {}) if isinstance(g.get("awayTeam"), dict) else {}
+        gid = str(g.get("gameId"))
+        sb_by_game[gid] = {
+            "gameId": gid,
+            "gameStatus": g.get("gameStatus"),
+            "gameStatusText": g.get("gameStatusText"),
+            "gameTimeUTC": g.get("gameTimeUTC"),
+            "home": {"teamTricode": home.get("teamTricode"), "score": home.get("score")},
+            "away": {"teamTricode": away.get("teamTricode"), "score": away.get("score")},
+        }
+
     fair = (await fairline_today()).get("items", []) or []
     fair_by_game: dict[str, dict[str, Any]] = {it["gameId"]: it for it in fair}
 
-    odds = (await odds_today()).get("offers", []) or []
+    odds_payload = await odds_today()
+    odds = (odds_payload.get("offers") or [])
+    fetched_at = odds_payload.get("fetched_at")
+
+    def implied_prob(odds_decimal: float) -> float:
+        return 1.0 / odds_decimal
+
     edges: list[dict[str, Any]] = []
 
     for offer in odds:
         if offer.get("market") != market:
             continue
+
         odds_dec = float(offer.get("odds_decimal") or 0)
         if odds_dec <= 1.0:
             continue
@@ -507,6 +539,7 @@ async def edges_today(
         if game_id and game_id in fair_by_game:
             fair_item = fair_by_game[game_id]
         else:
+            # Match by tricodes if present (The Odds API)
             home = offer.get("gameHome")
             away = offer.get("gameAway")
             if home and away:
@@ -516,7 +549,7 @@ async def edges_today(
                         game_id = it.get("gameId")
                         break
 
-        if not fair_item:
+        if not fair_item or not game_id:
             continue
 
         dist = fair_item["dist"]
@@ -529,39 +562,53 @@ async def edges_today(
         line = float(offer.get("line"))
 
         if market == "spreads":
+            # Home spread normalization
             if side == "home":
                 home_spread = line
                 p = _prob_cover_spread(margin_mean, margin_std, home_spread)
                 pick = f"{fair_item['home']} {fmt_spread(home_spread)}"
+                fair_line = float(fair_item["fair"]["spread_home"])
             else:
                 home_spread = -line
                 p_home = _prob_cover_spread(margin_mean, margin_std, home_spread)
                 p = 1.0 - p_home
                 pick = f"{fair_item['away']} {fmt_spread(line)}"
+                fair_line = float(fair_item["fair"]["spread_home"])
         else:
             if side == "over":
                 p = _prob_over_total(total_mean, total_std, line)
                 pick = f"OVER {line}"
+                fair_line = float(fair_item["fair"]["total"])
             else:
                 p_over = _prob_over_total(total_mean, total_std, line)
                 p = 1.0 - p_over
                 pick = f"UNDER {line}"
+                fair_line = float(fair_item["fair"]["total"])
 
         ev = _ev_decimal(p, odds_dec)
         if ev < min_ev:
             continue
 
+        sb = sb_by_game.get(game_id, {})
         edges.append(
             {
                 "gameId": game_id,
+                "home": fair_item.get("home"),
+                "away": fair_item.get("away"),
+                "gameTimeUTC": sb.get("gameTimeUTC"),
+                "gameStatus": sb.get("gameStatus"),
+                "gameStatusText": sb.get("gameStatusText"),
                 "book": offer.get("book"),
                 "source": offer.get("source"),
                 "market": market,
                 "pick": pick,
-                "line": line,
+                "book_line": line,
+                "fair_line": round(fair_line, 3),
                 "odds_decimal": odds_dec,
-                "model_prob": round(p, 4),
-                "ev": round(ev, 4),
+                "implied_prob": round(implied_prob(odds_dec), 4),
+                "model_prob": round(float(p), 4),
+                "ev": round(float(ev), 4),
+                "fetched_at": fetched_at,
             }
         )
 
