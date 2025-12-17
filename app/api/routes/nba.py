@@ -12,27 +12,18 @@ from fastapi import APIRouter, Query
 
 router = APIRouter()
 
-# Live NBA scoreboard + odds feeds
 NBA_TODAY_SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 NBA_TODAY_ODDS_URL = "https://cdn.nba.com/static/json/liveData/odds/odds_todaysGames.json"
 
-# Optional: The Odds API (multi-bookmaker aggregator)
-# Docs: sport key basketball_nba, markets=spreads,totals, oddsFormat=decimal  [oai_citation:2‡The Odds API](https://the-odds-api.com/sports-odds-data/nba-odds.html?utm_source=chatgpt.com)
 THE_ODDS_API_SPORT = "basketball_nba"
 THE_ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/{sport}/odds"
 
-# ----------------------------
-# Baseline model parameters
-# ----------------------------
 LEAGUE_PPG_TEAM = 114.0
 LEAGUE_TOTAL = LEAGUE_PPG_TEAM * 2
 TOTAL_GAME_STD = 22.0
 HOME_COURT_PTS = 2.0
-SIMS = 3000  # keep light for production
+SIMS = 2500
 
-# ----------------------------
-# Team name mapping for The Odds API (home/away names -> tricodes)
-# ----------------------------
 TEAM_NAME_TO_TRICODE = {
     "Atlanta Hawks": "ATL",
     "Boston Celtics": "BOS",
@@ -68,9 +59,8 @@ TEAM_NAME_TO_TRICODE = {
     "Washington Wizards": "WAS",
 }
 
-# ----------------------------
-# Helpers
-# ----------------------------
+Market = Literal["spreads", "totals"]
+
 
 @dataclass(frozen=True)
 class GameState:
@@ -83,10 +73,6 @@ class GameState:
     seconds_remaining: float | None
 
 
-def _logistic(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
-
-
 def _std(xs: list[float]) -> float:
     if len(xs) < 2:
         return 0.0
@@ -95,12 +81,10 @@ def _std(xs: list[float]) -> float:
 
 
 def _normal_cdf(z: float) -> float:
-    # Standard normal CDF
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
 def _parse_gameclock_iso8601_duration(game_clock: str | None) -> float | None:
-    # e.g. "PT11M32.00S"
     if not game_clock or not isinstance(game_clock, str):
         return None
     m = re.match(r"^PT(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$", game_clock.strip())
@@ -118,16 +102,14 @@ def _estimate_seconds_remaining(raw_game: dict[str, Any]) -> float | None:
         return None
 
     sec_in_period = _parse_gameclock_iso8601_duration(raw_game.get("gameClock"))
+    if sec_in_period is None:
+        return None
 
     if current <= 4:
-        if sec_in_period is None:
-            return None
         remaining_full_periods = max(4 - current, 0)
         return sec_in_period + remaining_full_periods * 12 * 60
 
-    # OT: 5 minutes each; we only know remaining in current OT
-    if sec_in_period is None:
-        return None
+    # overtime current period only
     return sec_in_period
 
 
@@ -162,6 +144,44 @@ def _to_game_state(raw: dict[str, Any]) -> GameState:
     )
 
 
+# -----------------------------
+# SCOREBOARD (RESTORED)
+# -----------------------------
+@router.get("/scoreboard/today")
+async def scoreboard_today() -> dict:
+    try:
+        games = await _fetch_today_scoreboard_raw()
+    except httpx.RequestError as e:
+        return {"games": [], "upstream_error": str(e), "upstream_status": 502}
+    except httpx.HTTPStatusError as e:
+        return {"games": [], "upstream_error": str(e), "upstream_status": e.response.status_code}
+
+    simplified = []
+    for g in games:
+        home = g.get("homeTeam", {}) or {}
+        away = g.get("awayTeam", {}) or {}
+        simplified.append(
+            {
+                "gameId": str(g.get("gameId")),
+                "gameStatus": g.get("gameStatus"),
+                "gameStatusText": g.get("gameStatusText"),
+                "gameTimeUTC": g.get("gameTimeUTC"),
+                "home": {
+                    "teamTricode": home.get("teamTricode"),
+                    "score": home.get("score"),
+                },
+                "away": {
+                    "teamTricode": away.get("teamTricode"),
+                    "score": away.get("score"),
+                },
+            }
+        )
+    return {"games": simplified}
+
+
+# -----------------------------
+# FAIR LINE
+# -----------------------------
 def _simulate_fairline(state: GameState) -> dict[str, Any]:
     if state.seconds_remaining is None:
         seconds_remaining = 48 * 60
@@ -208,7 +228,7 @@ def _simulate_fairline(state: GameState) -> dict[str, Any]:
     home_win_prob = home_wins / SIMS
     away_win_prob = 1.0 - home_win_prob
 
-    fair_spread_home = -mean_margin  # negative => home favored
+    fair_spread_home = -mean_margin
 
     return {
         "gameId": state.game_id,
@@ -233,13 +253,34 @@ async def fairline_today() -> dict:
     return {"items": items}
 
 
-# ----------------------------
-# Odds normalization
-# ----------------------------
+# -----------------------------
+# PROJECTIONS (kept for UI compatibility)
+# -----------------------------
+@router.get("/projections/today")
+async def projections_today() -> dict:
+    raw = await _fetch_today_scoreboard_raw()
+    items = []
+    for rg in raw:
+        st = _to_game_state(rg)
+        if not st.home_tri:
+            continue
+        # fallback from fairline prob
+        fl = _simulate_fairline(st)
+        items.append({"gameId": st.game_id, "homeWinProb": fl["prob"]["home_win"], "awayWinProb": fl["prob"]["away_win"]})
+    return {"items": items}
 
-Market = Literal["spreads", "totals"]
+
+# -----------------------------
+# POSSESSION (safe empty for now)
+# -----------------------------
+@router.get("/possession/today")
+async def possession_today() -> dict:
+    return {"items": []}
 
 
+# -----------------------------
+# ODDS ingestion
+# -----------------------------
 def _decimal_from_str(x: Any) -> float | None:
     try:
         v = float(x)
@@ -248,10 +289,6 @@ def _decimal_from_str(x: Any) -> float | None:
         return v
     except Exception:
         return None
-
-
-def _implied_prob_from_decimal(odds: float) -> float:
-    return 1.0 / odds
 
 
 async def _fetch_nba_odds() -> list[dict[str, Any]]:
@@ -267,14 +304,8 @@ async def _fetch_theoddsapi_odds() -> list[dict[str, Any]] | None:
     if not api_key:
         return None
 
-    params = {
-        "regions": "us",
-        "markets": "spreads,totals",
-        "oddsFormat": "decimal",
-        "apiKey": api_key,
-    }
+    params = {"regions": "us", "markets": "spreads,totals", "oddsFormat": "decimal", "apiKey": api_key}
     url = THE_ODDS_API_URL.format(sport=THE_ODDS_API_SPORT)
-
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url, params=params)
     r.raise_for_status()
@@ -283,13 +314,9 @@ async def _fetch_theoddsapi_odds() -> list[dict[str, Any]] | None:
 
 def _normalize_nba_odds(nba_games: list[dict[str, Any]]) -> list[dict[str, Any]]:
     offers: list[dict[str, Any]] = []
-
     for g in nba_games:
         game_id = str(g.get("gameId"))
-        home_id = str(g.get("homeTeamId"))
-        away_id = str(g.get("awayTeamId"))
         markets = g.get("markets", []) or []
-
         for m in markets:
             name = (m.get("name") or "").lower()
             books = m.get("books", []) or []
@@ -297,19 +324,15 @@ def _normalize_nba_odds(nba_games: list[dict[str, Any]]) -> list[dict[str, Any]]
             if name == "spread":
                 for b in books:
                     book = b.get("name") or "Unknown"
-                    outcomes = b.get("outcomes", []) or []
-                    # outcomes: home/away with spread and odds
-                    for o in outcomes:
-                        side = (o.get("type") or "").lower()  # home/away
+                    for o in b.get("outcomes", []) or []:
+                        side = (o.get("type") or "").lower()
                         odds = _decimal_from_str(o.get("odds"))
-                        spread = o.get("spread")
                         try:
-                            line = float(spread)
+                            line = float(o.get("spread"))
                         except Exception:
                             continue
                         if odds is None:
                             continue
-
                         offers.append(
                             {
                                 "source": "nba_odds",
@@ -317,24 +340,19 @@ def _normalize_nba_odds(nba_games: list[dict[str, Any]]) -> list[dict[str, Any]]
                                 "market": "spreads",
                                 "gameId": game_id,
                                 "side": "home" if side == "home" else "away",
-                                "line": line,  # home line usually negative
+                                "line": line,
                                 "odds_decimal": odds,
-                                "homeTeamId": home_id,
-                                "awayTeamId": away_id,
                             }
                         )
 
-            # Totals market name varies; try a few common keys
             if name in {"total", "totals", "overunder", "over_under", "ou"}:
                 for b in books:
                     book = b.get("name") or "Unknown"
-                    outcomes = b.get("outcomes", []) or []
-                    for o in outcomes:
-                        side = (o.get("type") or "").lower()  # over/under
+                    for o in b.get("outcomes", []) or []:
+                        side = (o.get("type") or "").lower()
                         odds = _decimal_from_str(o.get("odds"))
-                        total = o.get("total") or o.get("points") or o.get("line")
                         try:
-                            line = float(total)
+                            line = float(o.get("total") or o.get("points") or o.get("line"))
                         except Exception:
                             continue
                         if odds is None:
@@ -350,14 +368,12 @@ def _normalize_nba_odds(nba_games: list[dict[str, Any]]) -> list[dict[str, Any]]
                                 "odds_decimal": odds,
                             }
                         )
-
     return offers
 
 
-def _normalize_theoddsapi(odds_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _normalize_theoddsapi(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     offers: list[dict[str, Any]] = []
-
-    for ev in odds_events:
+    for ev in events:
         home_name = ev.get("home_team")
         away_name = ev.get("away_team")
         home_tri = TEAM_NAME_TO_TRICODE.get(str(home_name), "")
@@ -365,36 +381,25 @@ def _normalize_theoddsapi(odds_events: list[dict[str, Any]]) -> list[dict[str, A
         if not home_tri or not away_tri:
             continue
 
-        bookmakers = ev.get("bookmakers", []) or []
-        for bk in bookmakers:
+        for bk in ev.get("bookmakers", []) or []:
             book = bk.get("title") or bk.get("key") or "Unknown"
-            markets = bk.get("markets", []) or []
-            for m in markets:
+            for m in bk.get("markets", []) or []:
                 mk = (m.get("key") or "").lower()
-                outcomes = m.get("outcomes", []) or []
+                outs = m.get("outcomes", []) or []
 
                 if mk == "spreads":
-                    # outcomes have name and point + price
-                    for o in outcomes:
+                    for o in outs:
                         team_name = o.get("name")
-                        point = o.get("point")
-                        price = o.get("price")
-                        odds = _decimal_from_str(price)
+                        odds = _decimal_from_str(o.get("price"))
                         try:
-                            line = float(point)
+                            line = float(o.get("point"))
                         except Exception:
                             continue
                         if odds is None:
                             continue
-
-                        side = None
-                        if str(team_name) == str(home_name):
-                            side = "home"
-                        elif str(team_name) == str(away_name):
-                            side = "away"
-                        else:
+                        side = "home" if str(team_name) == str(home_name) else "away" if str(team_name) == str(away_name) else None
+                        if not side:
                             continue
-
                         offers.append(
                             {
                                 "source": "the_odds_api",
@@ -403,24 +408,22 @@ def _normalize_theoddsapi(odds_events: list[dict[str, Any]]) -> list[dict[str, A
                                 "gameHome": home_tri,
                                 "gameAway": away_tri,
                                 "side": side,
-                                "line": line,  # line for the listed team
+                                "line": line,
                                 "odds_decimal": odds,
                             }
                         )
 
                 if mk == "totals":
-                    for o in outcomes:
-                        name = (o.get("name") or "").lower()  # over/under
-                        point = o.get("point")
-                        price = o.get("price")
-                        odds = _decimal_from_str(price)
+                    for o in outs:
+                        name = (o.get("name") or "").lower()
+                        if name not in {"over", "under"}:
+                            continue
+                        odds = _decimal_from_str(o.get("price"))
                         try:
-                            line = float(point)
+                            line = float(o.get("point"))
                         except Exception:
                             continue
                         if odds is None:
-                            continue
-                        if name not in {"over", "under"}:
                             continue
                         offers.append(
                             {
@@ -434,42 +437,30 @@ def _normalize_theoddsapi(odds_events: list[dict[str, Any]]) -> list[dict[str, A
                                 "odds_decimal": odds,
                             }
                         )
-
     return offers
 
 
 @router.get("/odds/today")
 async def odds_today() -> dict:
-    # Primary: NBA odds feed (multi-book)
     nba_games = await _fetch_nba_odds()
     offers = _normalize_nba_odds(nba_games)
 
-    # Optional: The Odds API (if key set)
     try:
         o = await _fetch_theoddsapi_odds()
         if o:
             offers.extend(_normalize_theoddsapi(o))
     except Exception:
-        # don't fail the endpoint if optional feed fails
         pass
 
     return {"offers": offers}
 
 
-# ----------------------------
-# Edge computation
-# ----------------------------
-
+# -----------------------------
+# EDGE computation
+# -----------------------------
 def _prob_cover_spread(margin_mean: float, margin_std: float, home_spread: float) -> float:
-    """
-    home_spread: sportsbook line for HOME (e.g., -2.5).
-    Home covers if margin > abs(line) when line negative.
-    Equivalent: margin + home_spread > 0
-    """
     if margin_std <= 1e-9:
         return 1.0 if (margin_mean + home_spread) > 0 else 0.0
-
-    # Need P(margin > -home_spread)
     threshold = -home_spread
     z = (threshold - margin_mean) / margin_std
     return 1.0 - _normal_cdf(z)
@@ -483,8 +474,12 @@ def _prob_over_total(total_mean: float, total_std: float, line: float) -> float:
 
 
 def _ev_decimal(p: float, odds_decimal: float) -> float:
-    # EV per $1 stake (profit expectation)
     return p * odds_decimal - 1.0
+
+
+def fmt_spread(x: float) -> str:
+    v = round(float(x) * 10) / 10
+    return f"{v:+g}"
 
 
 @router.get("/edges/today")
@@ -493,33 +488,22 @@ async def edges_today(
     min_ev: float = Query(default=0.02, ge=-1.0, le=10.0),
     max_results: int = Query(default=25, ge=1, le=200),
 ) -> dict:
-    """
-    Compute top positive-EV edges by comparing:
-      sportsbook prices -> implied payout
-      vs our model distribution -> probability
-
-    Output: sorted by EV descending.
-    """
-    # 1) fairlines by gameId (tricodes)
     fair = (await fairline_today()).get("items", []) or []
     fair_by_game: dict[str, dict[str, Any]] = {it["gameId"]: it for it in fair}
 
-    # 2) odds offers
     odds = (await odds_today()).get("offers", []) or []
-
     edges: list[dict[str, Any]] = []
 
     for offer in odds:
         if offer.get("market") != market:
             continue
-
         odds_dec = float(offer.get("odds_decimal") or 0)
         if odds_dec <= 1.0:
             continue
 
         game_id = offer.get("gameId")
-        # The Odds API offers may not have gameId; match by tricodes if present
         fair_item = None
+
         if game_id and game_id in fair_by_game:
             fair_item = fair_by_game[game_id]
         else:
@@ -545,20 +529,16 @@ async def edges_today(
         line = float(offer.get("line"))
 
         if market == "spreads":
-            # Normalize to HOME spread for probability
-            # If offer is for away with +2.5, the home spread is -2.5
             if side == "home":
                 home_spread = line
                 p = _prob_cover_spread(margin_mean, margin_std, home_spread)
                 pick = f"{fair_item['home']} {fmt_spread(home_spread)}"
             else:
-                # away spread: line is typically positive; home spread is -line
                 home_spread = -line
-                p_home_cover = _prob_cover_spread(margin_mean, margin_std, home_spread)
-                p = 1.0 - p_home_cover
+                p_home = _prob_cover_spread(margin_mean, margin_std, home_spread)
+                p = 1.0 - p_home
                 pick = f"{fair_item['away']} {fmt_spread(line)}"
-
-        else:  # totals
+        else:
             if side == "over":
                 p = _prob_over_total(total_mean, total_std, line)
                 pick = f"OVER {line}"
@@ -587,8 +567,3 @@ async def edges_today(
 
     edges.sort(key=lambda x: x["ev"], reverse=True)
     return {"items": edges[:max_results]}
-
-
-def fmt_spread(x: float) -> str:
-    v = round(float(x) * 10) / 10
-    return f"{v:+g}"
